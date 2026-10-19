@@ -21,6 +21,35 @@ This package contains the LangChain integrations for OpenAI through their `opena
 
 For full documentation, see the [API reference](https://reference.langchain.com/python/integrations/langchain_openai/). For conceptual guides, tutorials, and examples on using these classes, see the [LangChain Docs](https://docs.langchain.com/oss/python/integrations/providers/openai).
 
+## Request compression (experimental)
+
+Install the optional codec, then enable zstd for the direct OpenAI Responses API:
+
+```bash
+uv add zstandard
+```
+
+```python
+from langchain_openai import ChatOpenAI
+
+model = ChatOpenAI(
+    model="gpt-6.1-sol",
+    use_responses_api=True,
+    request_compression="zstd",
+)
+```
+
+The default is `None` and does not import the codec. Explicit zstd compresses every
+inference request without a payload-size threshold, including requests for
+streaming responses. It changes upload bytes, not token usage or the model context
+limit. OpenAI requires both bodies to be at most 128 MiB and the decompressed body
+to be at most 100 times the compressed size; incompatible requests raise an error
+before sending. See [OpenAI's compression contract](https://developers.openai.com/api/docs/guides/production-best-practices#compress-request-bodies).
+
+This experimental option requires clients created by `ChatOpenAI`. Chat
+Completions, Azure, custom API endpoints, and caller-owned clients are outside its
+support contract. Auxiliary API requests remain unchanged.
+
 ## 📕 Releases & Versioning
 
 See our [Releases](https://docs.langchain.com/oss/python/release-policy) and [Versioning](https://docs.langchain.com/oss/python/versioning) policies.

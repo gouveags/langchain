@@ -21,6 +21,7 @@ import urllib.request
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from functools import lru_cache
 from typing import Any, TypeVar, cast
+from urllib.parse import urlsplit
 
 import openai
 from pydantic import SecretStr
@@ -360,8 +361,124 @@ def _resolve_socket_options(
     return tuple(value)
 
 
+_MAX_REQUEST_BYTES = 128 * 1024 * 1024
+_MAX_COMPRESSION_RATIO = 100
+
+
+def _validate_compression_destination(base_url: str) -> None:
+    url = urlsplit(base_url)
+    if (
+        url.scheme != "https"
+        or url.hostname != "api.openai.com"
+        or url.port not in (None, 443)
+        or url.username is not None
+        or url.password is not None
+        or url.path.rstrip("/") != "/v1"
+        or url.query
+        or url.fragment
+    ):
+        msg = 'request_compression="zstd" requires https://api.openai.com/v1.'
+        raise ValueError(msg)
+
+
+def _validate_compressed_request(request: Any) -> None:
+    _validate_compression_destination(
+        str(request.url.copy_with(path="/v1", query=None))
+    )
+    if request.extensions.get("langchain.request_compression") is None:
+        return
+    if request.method != "POST" or request.url.path != "/v1/responses":
+        msg = "request_compression requires POST /v1/responses."
+        raise ValueError(msg)
+    if request.headers.get("content-encoding") != "zstd":
+        msg = "request_compression encoding changed before sending."
+        raise ValueError(msg)
+
+
+async def _validate_compressed_async_request(request: Any) -> None:
+    _validate_compressed_request(request)
+
+
+def _add_compression_hook(kwargs: dict[str, Any], *, asynchronous: bool) -> None:
+    hooks = {
+        name: list(values) for name, values in (kwargs.get("event_hooks") or {}).items()
+    }
+    hooks.setdefault("request", []).append(
+        _validate_compressed_async_request
+        if asynchronous
+        else _validate_compressed_request
+    )
+    kwargs["event_hooks"] = hooks
+
+
+def _compress_request(request: Any, encoding: str | None) -> Any:
+    if encoding is None:
+        return request
+    if encoding != "zstd":
+        msg = 'OpenAI request_compression must be None or "zstd".'
+        raise ValueError(msg)
+    _validate_compression_destination(
+        str(request.url.copy_with(path="/v1", query=None))
+    )
+    if request.method == "POST" and request.url.path == "/v1/chat/completions":
+        msg = 'request_compression="zstd" requires the Responses API.'
+        raise ValueError(msg)
+    if request.method != "POST" or request.url.path != "/v1/responses":
+        return request
+    headers = request.headers.copy()
+    if "content-encoding" in headers:
+        msg = "request_compression cannot be combined with Content-Encoding."
+        raise ValueError(msg)
+    if headers.get("content-type", "").split(";")[0].strip() != "application/json":
+        msg = "request_compression requires a buffered JSON request body."
+        raise ValueError(msg)
+    try:
+        content = request.content
+    except httpx.RequestNotRead as exc:
+        msg = "request_compression requires a buffered JSON request body."
+        raise ValueError(msg) from exc
+    if len(content) > _MAX_REQUEST_BYTES:
+        msg = "OpenAI request body exceeds the documented 128 MiB limit."
+        raise ValueError(msg)
+    try:
+        import zstandard
+    except ImportError as exc:
+        msg = 'request_compression="zstd" requires zstandard: uv add zstandard.'
+        raise ImportError(msg) from exc
+    compressed = zstandard.ZstdCompressor(level=3).compress(content)
+    if len(compressed) > _MAX_REQUEST_BYTES:
+        msg = "OpenAI compressed request body exceeds the documented 128 MiB limit."
+        raise ValueError(msg)
+    if len(content) > len(compressed) * _MAX_COMPRESSION_RATIO:
+        msg = "OpenAI request body exceeds the documented 100x compression ratio limit."
+        raise ValueError(msg)
+    headers.pop("content-length", None)
+    headers["Content-Encoding"] = encoding
+    extensions = request.extensions.copy()
+    extensions["langchain.request_compression"] = encoding
+    return type(request)(
+        method=request.method,
+        url=request.url,
+        headers=headers,
+        content=compressed,
+        extensions=extensions,
+    )
+
+
 class _SyncHttpxClientWrapper(openai.DefaultHttpxClient):
     """Borrowed from openai._base_client."""
+
+    def __init__(
+        self, *, request_compression: str | None = None, **kwargs: Any
+    ) -> None:
+        if request_compression is not None:
+            _add_compression_hook(kwargs, asynchronous=False)
+        super().__init__(**kwargs)
+        self._request_compression = request_compression
+
+    def build_request(self, method: str, url: Any, **kwargs: Any) -> Any:
+        request = super().build_request(method, url, **kwargs)
+        return _compress_request(request, self._request_compression)
 
     def __del__(self) -> None:
         try:
@@ -375,6 +492,18 @@ class _SyncHttpxClientWrapper(openai.DefaultHttpxClient):
 class _AsyncHttpxClientWrapper(openai.DefaultAsyncHttpxClient):
     """Borrowed from openai._base_client."""
 
+    def __init__(
+        self, *, request_compression: str | None = None, **kwargs: Any
+    ) -> None:
+        if request_compression is not None:
+            _add_compression_hook(kwargs, asynchronous=True)
+        super().__init__(**kwargs)
+        self._request_compression = request_compression
+
+    def build_request(self, method: str, url: Any, **kwargs: Any) -> Any:
+        request = super().build_request(method, url, **kwargs)
+        return _compress_request(request, self._request_compression)
+
     def __del__(self) -> None:
         try:
             if self.is_closed:
@@ -385,10 +514,43 @@ class _AsyncHttpxClientWrapper(openai.DefaultAsyncHttpxClient):
             pass
 
 
+class _SyncProxyHttpxClientWrapper(httpx.Client):
+    """Keep the proxy path's plain HTTP client defaults."""
+
+    def __init__(
+        self, *, request_compression: str | None = None, **kwargs: Any
+    ) -> None:
+        if request_compression is not None:
+            _add_compression_hook(kwargs, asynchronous=False)
+        super().__init__(**kwargs)
+        self._request_compression = request_compression
+
+    def build_request(self, method: str, url: Any, **kwargs: Any) -> Any:
+        request = super().build_request(method, url, **kwargs)
+        return _compress_request(request, self._request_compression)
+
+
+class _AsyncProxyHttpxClientWrapper(httpx.AsyncClient):
+    """Keep the proxy path's plain HTTP client defaults."""
+
+    def __init__(
+        self, *, request_compression: str | None = None, **kwargs: Any
+    ) -> None:
+        if request_compression is not None:
+            _add_compression_hook(kwargs, asynchronous=True)
+        super().__init__(**kwargs)
+        self._request_compression = request_compression
+
+    def build_request(self, method: str, url: Any, **kwargs: Any) -> Any:
+        request = super().build_request(method, url, **kwargs)
+        return _compress_request(request, self._request_compression)
+
+
 def _build_sync_httpx_client(
     base_url: str | None,
     timeout: Any,
     socket_options: tuple[SocketOption, ...] = (),
+    request_compression: str | None = None,
 ) -> _SyncHttpxClientWrapper:
     kwargs: dict[str, Any] = {
         "base_url": base_url
@@ -403,13 +565,14 @@ def _build_sync_httpx_client(
             socket_options=list(socket_options),
             limits=_DEFAULT_CONNECTION_LIMITS,
         )
-    return _SyncHttpxClientWrapper(**kwargs)
+    return _SyncHttpxClientWrapper(request_compression=request_compression, **kwargs)
 
 
 def _build_async_httpx_client(
     base_url: str | None,
     timeout: Any,
     socket_options: tuple[SocketOption, ...] = (),
+    request_compression: str | None = None,
 ) -> _AsyncHttpxClientWrapper:
     kwargs: dict[str, Any] = {
         "base_url": base_url
@@ -423,21 +586,30 @@ def _build_async_httpx_client(
             socket_options=list(socket_options),
             limits=_DEFAULT_CONNECTION_LIMITS,
         )
-    return _AsyncHttpxClientWrapper(**kwargs)
+    return _AsyncHttpxClientWrapper(request_compression=request_compression, **kwargs)
 
 
 def _build_proxied_sync_httpx_client(
     proxy: str,
     verify: Any,
     socket_options: tuple[SocketOption, ...] = (),
+    request_compression: str | None = None,
 ) -> httpx.Client:
     """httpx.Client for the openai_proxy code path.
 
     When socket options are disabled (`()`), returns a plain
     `httpx.Client(proxy=..., verify=...)` with no transport injected.
     """
+    if request_compression is not None:
+        client_class: Any = _SyncProxyHttpxClientWrapper
+        compression_kwargs: dict[str, Any] = {
+            "request_compression": request_compression
+        }
+    else:
+        client_class = httpx.Client
+        compression_kwargs = {}
     if not socket_options:
-        return httpx.Client(proxy=proxy, verify=verify)
+        return client_class(proxy=proxy, verify=verify, **compression_kwargs)
     # Mount under `all://` (not `transport=`) so `Client._mounts` mirrors the
     # shape produced by httpx's own `proxy=` path — a single-entry dict keyed
     # by `URLPattern("all://")`. Callers (and the existing proxy integration
@@ -453,13 +625,14 @@ def _build_proxied_sync_httpx_client(
         socket_options=list(socket_options),
         limits=_DEFAULT_CONNECTION_LIMITS,
     )
-    return httpx.Client(mounts={"all://": transport})
+    return client_class(mounts={"all://": transport}, **compression_kwargs)
 
 
 def _build_proxied_async_httpx_client(
     proxy: str,
     verify: Any,
     socket_options: tuple[SocketOption, ...] = (),
+    request_compression: str | None = None,
 ) -> httpx.AsyncClient:
     """httpx.AsyncClient for the openai_proxy code path.
 
@@ -467,15 +640,23 @@ def _build_proxied_async_httpx_client(
     the `mounts={"all://": ...}` shape, and the `httpx.Proxy` wrapping
     rationale.
     """
+    if request_compression is not None:
+        client_class: Any = _AsyncProxyHttpxClientWrapper
+        compression_kwargs: dict[str, Any] = {
+            "request_compression": request_compression
+        }
+    else:
+        client_class = httpx.AsyncClient
+        compression_kwargs = {}
     if not socket_options:
-        return httpx.AsyncClient(proxy=proxy, verify=verify)
+        return client_class(proxy=proxy, verify=verify, **compression_kwargs)
     transport = httpx.AsyncHTTPTransport(
         proxy=httpx.Proxy(proxy),
         verify=verify,
         socket_options=list(socket_options),
         limits=_DEFAULT_CONNECTION_LIMITS,
     )
-    return httpx.AsyncClient(mounts={"all://": transport})
+    return client_class(mounts={"all://": transport}, **compression_kwargs)
 
 
 @lru_cache
@@ -483,8 +664,11 @@ def _cached_sync_httpx_client(
     base_url: str | None,
     timeout: Any,
     socket_options: tuple[SocketOption, ...] = (),
+    request_compression: str | None = None,
 ) -> _SyncHttpxClientWrapper:
-    return _build_sync_httpx_client(base_url, timeout, socket_options)
+    return _build_sync_httpx_client(
+        base_url, timeout, socket_options, request_compression
+    )
 
 
 @lru_cache
@@ -492,14 +676,18 @@ def _cached_async_httpx_client(
     base_url: str | None,
     timeout: Any,
     socket_options: tuple[SocketOption, ...] = (),
+    request_compression: str | None = None,
 ) -> _AsyncHttpxClientWrapper:
-    return _build_async_httpx_client(base_url, timeout, socket_options)
+    return _build_async_httpx_client(
+        base_url, timeout, socket_options, request_compression
+    )
 
 
 def _get_default_httpx_client(
     base_url: str | None,
     timeout: Any,
     socket_options: tuple[SocketOption, ...] = (),
+    request_compression: str | None = None,
 ) -> _SyncHttpxClientWrapper:
     """Get default httpx client.
 
@@ -508,15 +696,20 @@ def _get_default_httpx_client(
     try:
         hash(timeout)
     except TypeError:
-        return _build_sync_httpx_client(base_url, timeout, socket_options)
+        return _build_sync_httpx_client(
+            base_url, timeout, socket_options, request_compression
+        )
     else:
-        return _cached_sync_httpx_client(base_url, timeout, socket_options)
+        return _cached_sync_httpx_client(
+            base_url, timeout, socket_options, request_compression
+        )
 
 
 def _get_default_async_httpx_client(
     base_url: str | None,
     timeout: Any,
     socket_options: tuple[SocketOption, ...] = (),
+    request_compression: str | None = None,
 ) -> _AsyncHttpxClientWrapper:
     """Get default httpx client.
 
@@ -525,9 +718,13 @@ def _get_default_async_httpx_client(
     try:
         hash(timeout)
     except TypeError:
-        return _build_async_httpx_client(base_url, timeout, socket_options)
+        return _build_async_httpx_client(
+            base_url, timeout, socket_options, request_compression
+        )
     else:
-        return _cached_async_httpx_client(base_url, timeout, socket_options)
+        return _cached_async_httpx_client(
+            base_url, timeout, socket_options, request_compression
+        )
 
 
 def _resolve_sync_and_async_api_keys(

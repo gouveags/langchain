@@ -157,6 +157,7 @@ def test_http_socket_options_none_vs_empty_tuple_vs_populated(
         base_url: str | None,
         timeout: Any,
         socket_options: tuple = (),
+        request_compression: str | None = None,
     ) -> Any:
         recorded.append(("async", (base_url, timeout), tuple(socket_options)))
         # Return a real (but unused) client so init completes.
@@ -168,6 +169,7 @@ def test_http_socket_options_none_vs_empty_tuple_vs_populated(
         base_url: str | None,
         timeout: Any,
         socket_options: tuple = (),
+        request_compression: str | None = None,
     ) -> Any:
         recorded.append(("sync", (base_url, timeout), tuple(socket_options)))
         return _client_utils._SyncHttpxClientWrapper(
@@ -212,7 +214,12 @@ def test_openai_proxy_branch_applies_socket_options(
     """`openai_proxy` path must go through the socket-options-aware proxied helper."""
     recorded: list[dict[str, Any]] = []
 
-    def spy(proxy: str, verify: Any, socket_options: tuple = ()) -> httpx.AsyncClient:
+    def spy(
+        proxy: str,
+        verify: Any,
+        socket_options: tuple = (),
+        request_compression: str | None = None,
+    ) -> httpx.AsyncClient:
         recorded.append(
             {"proxy": proxy, "verify": verify, "socket_options": socket_options}
         )
@@ -225,7 +232,12 @@ def test_openai_proxy_branch_applies_socket_options(
     # Sync branch should also be covered — spy on that too.
     sync_recorded: list[dict[str, Any]] = []
 
-    def sync_spy(proxy: str, verify: Any, socket_options: tuple = ()) -> httpx.Client:
+    def sync_spy(
+        proxy: str,
+        verify: Any,
+        socket_options: tuple = (),
+        request_compression: str | None = None,
+    ) -> httpx.Client:
         sync_recorded.append(
             {"proxy": proxy, "verify": verify, "socket_options": socket_options}
         )
@@ -758,9 +770,10 @@ def test_client_build_skips_transport_on_proxy_env_default_shape(
         base_url: str | None,
         timeout: Any,
         socket_options: tuple = (),
+        request_compression: str | None = None,
     ) -> Any:
         recorded.append(socket_options)
-        return original_build(base_url, timeout, socket_options)
+        return original_build(base_url, timeout, socket_options, request_compression)
 
     monkeypatch.setattr(_client_utils, "_build_async_httpx_client", spy)
     # `_get_default_async_httpx_client` reaches the cached builder directly,
@@ -797,9 +810,10 @@ def test_client_build_applies_socket_options_when_user_opts_in(
         base_url: str | None,
         timeout: Any,
         socket_options: tuple = (),
+        request_compression: str | None = None,
     ) -> Any:
         recorded.append(socket_options)
-        return original_build(base_url, timeout, socket_options)
+        return original_build(base_url, timeout, socket_options, request_compression)
 
     monkeypatch.setattr(_client_utils, "_build_async_httpx_client", spy)
     monkeypatch.setattr(_client_utils, "_cached_async_httpx_client", spy)

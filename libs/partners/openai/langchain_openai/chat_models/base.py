@@ -137,6 +137,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     SecretStr,
     ValidationError,
     field_validator,
@@ -157,6 +158,7 @@ from langchain_openai.chat_models._client_utils import (
     _resolve_socket_options,
     _resolve_sync_and_async_api_keys,
     _should_bypass_socket_options_for_proxy_env,
+    _validate_compression_destination,
     _warn_if_proxy_env_shadowed,
 )
 from langchain_openai.chat_models._compat import (
@@ -790,6 +792,8 @@ class BaseChatOpenAI(BaseChatModel):
     full provider support.
     """
 
+    _owned_clients: dict[str, Any] = PrivateAttr(default_factory=dict)
+
     client: Any = Field(default=None, exclude=True)
 
     async_client: Any = Field(default=None, exclude=True)
@@ -1011,6 +1015,18 @@ class BaseChatOpenAI(BaseChatModel):
     or when using one of the many model providers that expose an OpenAI-like
     API but with different models. In those cases, in order to avoid erroring
     when tiktoken is called, you can specify a model name to use here.
+    """
+
+    request_compression: Literal["zstd"] | None = None
+    """Compress serialized Responses JSON with zstd, without a size threshold.
+
+    !!! warning "Experimental"
+
+        Request compression is experimental and its configuration may change.
+
+    Requires `use_responses_api=True`, the direct HTTPS OpenAI API, and the optional
+    `zstandard` package. Defaults to disabled. OpenAI's size and ratio limits apply.
+    This changes upload bytes only; token usage and response streaming are unchanged.
     """
 
     default_headers: Mapping[str, str] | None = None
@@ -1400,6 +1416,39 @@ class BaseChatOpenAI(BaseChatModel):
             self.use_responses_api = True
         return self
 
+    def _get_configurable_init_params(self) -> dict[str, Any]:
+        params = super()._get_configurable_init_params()
+        return {
+            name: value
+            for name, value in params.items()
+            if name not in self._owned_clients or value is not self._owned_clients[name]
+        }
+
+    @model_validator(mode="after")
+    def _validate_request_compression(self) -> Self:
+        if self.request_compression is None:
+            return self
+        if hasattr(self, "azure_endpoint") or self.use_responses_api is not True:
+            msg = (
+                'request_compression="zstd" requires the direct OpenAI Responses API '
+                "with use_responses_api=True."
+            )
+            raise ValueError(msg)
+        if any(
+            getattr(self, name) is not None
+            for name in (
+                "client",
+                "async_client",
+                "root_client",
+                "root_async_client",
+                "http_client",
+                "http_async_client",
+            )
+        ):
+            msg = "request_compression cannot be combined with caller-owned clients."
+            raise ValueError(msg)
+        return self
+
     @model_validator(mode="after")
     def validate_environment(self) -> Self:
         """Validate that api key and python package exists in environment."""
@@ -1427,6 +1476,12 @@ class BaseChatOpenAI(BaseChatModel):
         self.openai_api_base = _gateway_config.base_url
         self.openai_api_key = _gateway_config.api_key
         _base_url_from_gateway = _gateway_config.base_url_from_gateway
+        if self.request_compression is not None:
+            _validate_compression_destination(
+                self.openai_api_base
+                or os.environ.get("OPENAI_BASE_URL")
+                or "https://api.openai.com/v1"
+            )
 
         # Enable stream_usage by default if using default base URL and client,
         # or when the base URL was set by the LangSmith gateway (which proxies
@@ -1497,11 +1552,15 @@ class BaseChatOpenAI(BaseChatModel):
             _warn_if_proxy_env_shadowed(
                 resolved_socket_options, openai_proxy=self.openai_proxy
             )
-        if not self.client:
-            if sync_api_key_value is None:
-                # No valid sync API key, leave client as None and raise informative
-                # error on invocation.
-                self.client = None
+        # Responses uses the root even when a chat resource was explicitly supplied.
+        if not self.client or (
+            self.use_responses_api is True and self.root_client is None
+        ):
+            if self.root_client is not None:
+                self.client = self.root_client.chat.completions
+                self._owned_clients["client"] = self.client
+            elif sync_api_key_value is None:
+                # A sync root needs a synchronous key; retain supplied resources.
                 self.root_client = None
             else:
                 if self.openai_proxy and not self.http_client:
@@ -1509,6 +1568,7 @@ class BaseChatOpenAI(BaseChatModel):
                         proxy=self.openai_proxy,
                         verify=global_ssl_context,
                         socket_options=resolved_socket_options,
+                        request_compression=self.request_compression,
                     )
                 sync_specific = {
                     "http_client": self.http_client
@@ -1516,32 +1576,51 @@ class BaseChatOpenAI(BaseChatModel):
                         self.openai_api_base,
                         self.request_timeout,
                         resolved_socket_options,
+                        self.request_compression,
                     ),
                     "api_key": sync_api_key_value,
                 }
                 self.root_client = openai.OpenAI(**client_params, **sync_specific)  # type: ignore[arg-type]
-                self.client = self.root_client.chat.completions
-        if not self.async_client:
-            if self.openai_proxy and not self.http_async_client:
-                self.http_async_client = _build_proxied_async_httpx_client(
-                    proxy=self.openai_proxy,
-                    verify=global_ssl_context,
-                    socket_options=resolved_socket_options,
+                self._owned_clients["root_client"] = self.root_client
+                if not self.client:
+                    self.client = self.root_client.chat.completions
+                    self._owned_clients["client"] = self.client
+                if self.openai_proxy:
+                    self._owned_clients["http_client"] = self.http_client
+        if not self.async_client or (
+            self.use_responses_api is True and self.root_async_client is None
+        ):
+            if self.root_async_client is not None:
+                self.async_client = self.root_async_client.chat.completions
+                self._owned_clients["async_client"] = self.async_client
+            else:
+                if self.openai_proxy and not self.http_async_client:
+                    self.http_async_client = _build_proxied_async_httpx_client(
+                        proxy=self.openai_proxy,
+                        verify=global_ssl_context,
+                        socket_options=resolved_socket_options,
+                        request_compression=self.request_compression,
+                    )
+                async_specific = {
+                    "http_client": self.http_async_client
+                    or _get_default_async_httpx_client(
+                        self.openai_api_base,
+                        self.request_timeout,
+                        resolved_socket_options,
+                        self.request_compression,
+                    ),
+                    "api_key": async_api_key_value,
+                }
+                self.root_async_client = openai.AsyncOpenAI(
+                    **client_params,
+                    **async_specific,  # type: ignore[arg-type]
                 )
-            async_specific = {
-                "http_client": self.http_async_client
-                or _get_default_async_httpx_client(
-                    self.openai_api_base,
-                    self.request_timeout,
-                    resolved_socket_options,
-                ),
-                "api_key": async_api_key_value,
-            }
-            self.root_async_client = openai.AsyncOpenAI(
-                **client_params,
-                **async_specific,  # type: ignore[arg-type]
-            )
-            self.async_client = self.root_async_client.chat.completions
+                self._owned_clients["root_async_client"] = self.root_async_client
+                if not self.async_client:
+                    self.async_client = self.root_async_client.chat.completions
+                    self._owned_clients["async_client"] = self.async_client
+                if self.openai_proxy:
+                    self._owned_clients["http_async_client"] = self.http_async_client
         return self
 
     def _resolve_model_profile(self) -> ModelProfile | None:
