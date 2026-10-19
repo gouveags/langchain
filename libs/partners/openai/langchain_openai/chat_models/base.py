@@ -1436,6 +1436,7 @@ class BaseChatOpenAI(BaseChatModel):
             raise ValueError(msg)
         if any(
             getattr(self, name) is not None
+            and getattr(self, name) is not self._owned_clients.get(name)
             for name in (
                 "client",
                 "async_client",
@@ -1552,9 +1553,9 @@ class BaseChatOpenAI(BaseChatModel):
             _warn_if_proxy_env_shadowed(
                 resolved_socket_options, openai_proxy=self.openai_proxy
             )
-        # Responses uses the root even when a chat resource was explicitly supplied.
+        # Responses and structured parsing use roots alongside chat resources.
         if not self.client or (
-            self.use_responses_api is True and self.root_client is None
+            self.root_client is None and sync_api_key_value is not None
         ):
             if self.root_client is not None:
                 self.client = self.root_client.chat.completions
@@ -1588,7 +1589,7 @@ class BaseChatOpenAI(BaseChatModel):
                 if self.openai_proxy:
                     self._owned_clients["http_client"] = self.http_client
         if not self.async_client or (
-            self.use_responses_api is True and self.root_async_client is None
+            self.root_async_client is None and async_api_key_value is not None
         ):
             if self.root_async_client is not None:
                 self.async_client = self.root_async_client.chat.completions

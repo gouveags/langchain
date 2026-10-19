@@ -13,7 +13,7 @@ import pytest
 import zstandard
 from langchain_core.runnables import ConfigurableField
 from langchain_core.runnables.configurable import RunnableConfigurableFields
-from pydantic import SecretStr
+from pydantic import BaseModel, SecretStr, TypeAdapter
 
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langchain_openai._compat import httpx
@@ -86,6 +86,33 @@ async def wire_requests(
                         "type": "rate_limit_error",
                         "code": "rate_limit_exceeded",
                     }
+                },
+            )
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_test",
+                    "object": "chat.completion",
+                    "created": 1234567890,
+                    "model": "gpt-test",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": '{"answer":"hello"}',
+                                "refusal": None,
+                            },
+                            "finish_reason": "stop",
+                            "logprobs": None,
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 2,
+                        "completion_tokens": 1,
+                        "total_tokens": 3,
+                    },
                 },
             )
         content = (
@@ -951,3 +978,137 @@ def test_chat_completions_resource_only_does_not_build_unused_sdk_roots(
     assert model.root_client is None
     assert model.root_async_client is None
     assert wire_requests == []
+
+
+class CompressionModelHolder(BaseModel):
+    model: ChatOpenAI
+
+
+@pytest.mark.parametrize("compression", [None, "zstd"])
+@pytest.mark.parametrize("entry", ["model_validate", "holder", "type_adapter"])
+def test_existing_model_revalidation_preserves_identity_and_wire_codec(
+    wire_requests: list[Any], compression: str | None, entry: str
+) -> None:
+    original = make_model(request_compression=compression)
+    original_root = original.root_client
+    original_async_root = original.root_async_client
+    if entry == "model_validate":
+        validated = ChatOpenAI.model_validate(original)
+    elif entry == "holder":
+        validated = CompressionModelHolder.model_validate({"model": original}).model
+    else:
+        validated = TypeAdapter(ChatOpenAI).validate_python(original)
+    assert validated is original
+    assert validated.root_client is original_root
+    assert validated.root_async_client is original_async_root
+    assert validated.invoke("hello").text == "hello"
+    assert_wire(wire_requests[0], compression)
+
+
+@pytest.mark.parametrize("field", ["client", "async_client"])
+def test_existing_enabled_model_revalidation_rejects_replaced_clients(
+    wire_requests: list[Any], field: str
+) -> None:
+    original = make_model(request_compression="zstd")
+    replacement = object()
+    setattr(original, field, replacement)
+    with pytest.raises(ValueError, match="client"):
+        ChatOpenAI.model_validate(original)
+    assert getattr(original, field) is replacement
+    assert wire_requests == []
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("reconstructed", [False, True])
+async def test_resource_override_supports_deferred_responses_routing(
+    wire_requests: list[Any], *, asynchronous: bool, reconstructed: bool
+) -> None:
+    original = make_model(
+        api_key="fake-original",
+        base_url="https://original.example/v1",
+        use_responses_api=None,
+    )
+    original_root = original.root_client
+    original_async_root = original.root_async_client
+    field = "async_client" if asynchronous else "client"
+    expected_resource = getattr(original, field)
+    selected = original
+    config = None
+    if reconstructed:
+        supplied_model = make_model(
+            api_key="fake-other", base_url="https://other.example/v1"
+        )
+        expected_resource = getattr(supplied_model, field)
+        configurable = original.configurable_fields(
+            **{field: ConfigurableField(id="resource")}
+        )
+        assert isinstance(configurable, RunnableConfigurableFields)
+        prepared, config = configurable.prepare(
+            {"configurable": {"resource": expected_resource}}
+        )
+        assert isinstance(prepared, ChatOpenAI)
+        selected = prepared
+    assert isinstance(selected, ChatOpenAI)
+    result = (
+        await selected.ainvoke("hello", config, previous_response_id="resp_previous")
+        if asynchronous
+        else selected.invoke("hello", config, previous_response_id="resp_previous")
+    )
+    assert result.text == "hello"
+    assert getattr(selected, field) is expected_resource
+    assert selected.root_client is not None
+    assert selected.root_async_client is not None
+    assert wire_requests[0].url.host == "original.example"
+    assert wire_requests[0].url.path == "/v1/responses"
+    assert wire_requests[0].headers["Authorization"] == "Bearer fake-original"
+    assert "Content-Encoding" not in wire_requests[0].headers
+    assert (
+        json.loads(wire_requests[0].content)["previous_response_id"] == "resp_previous"
+    )
+    assert original.root_client is original_root
+    assert original.root_async_client is original_async_root
+
+
+class StructuredAnswer(BaseModel):
+    answer: str
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_resource_override_supports_chat_completions_structured_parse(
+    wire_requests: list[Any], *, asynchronous: bool
+) -> None:
+    original = make_model(
+        api_key="fake-original",
+        base_url="https://original.example/v1",
+        use_responses_api=False,
+    )
+    supplied_model = make_model(
+        api_key="fake-other", base_url="https://other.example/v1"
+    )
+    field = "async_client" if asynchronous else "client"
+    supplied_resource = getattr(supplied_model, field)
+    configurable = original.configurable_fields(
+        **{field: ConfigurableField(id="resource")}
+    )
+    assert isinstance(configurable, RunnableConfigurableFields)
+    prepared, config = configurable.prepare(
+        {"configurable": {"resource": supplied_resource}}
+    )
+    assert isinstance(prepared, ChatOpenAI)
+    structured = prepared.with_structured_output(StructuredAnswer, method="json_schema")
+    result = (
+        await structured.ainvoke("hello", config)
+        if asynchronous
+        else structured.invoke("hello", config)
+    )
+    assert result == StructuredAnswer(answer="hello")
+    assert getattr(prepared, field) is supplied_resource
+    assert prepared.root_client is not None
+    assert prepared.root_async_client is not None
+    assert wire_requests[0].url.host == "original.example"
+    assert wire_requests[0].url.path == "/v1/chat/completions"
+    assert wire_requests[0].headers["Authorization"] == "Bearer fake-original"
+    assert "Content-Encoding" not in wire_requests[0].headers
+    assert (
+        json.loads(wire_requests[0].content)["response_format"]["type"] == "json_schema"
+    )
