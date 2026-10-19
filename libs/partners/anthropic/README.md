@@ -21,6 +21,27 @@ This package contains the LangChain integration for Anthropic's generative model
 
 For full documentation, see the [API reference](https://reference.langchain.com/python/integrations/langchain_anthropic/). For conceptual guides, tutorials, and examples on using these classes, see the [LangChain Docs](https://docs.langchain.com/oss/python/integrations/providers/anthropic).
 
+## Request compression (experimental)
+
+Enable gzip for serialized JSON sent to the direct Anthropic Messages API:
+
+```python
+from langchain_anthropic import ChatAnthropic
+
+model = ChatAnthropic(
+    model="claude-sonnet-5-5",
+    request_compression="gzip",
+)
+```
+
+The default is `None`. Explicit gzip compresses every inference request without a
+payload-size threshold, including requests for streaming responses. It changes
+upload bytes, not token usage or the model context limit. Token-counting requests
+remain unchanged. Custom API endpoints and cloud gateways are outside this
+experimental option's support contract. See Anthropic's documented
+[gzip setting](https://code.claude.com/docs/en/env-vars.md);
+compression does not change the API's request-body limit.
+
 ## 📕 Releases & Versioning
 
 See our [Releases](https://docs.langchain.com/oss/python/release-policy) and [Versioning](https://docs.langchain.com/oss/python/versioning) policies.

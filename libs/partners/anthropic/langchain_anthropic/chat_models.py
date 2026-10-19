@@ -82,6 +82,7 @@ from langchain_anthropic import __version__
 from langchain_anthropic._client_utils import (
     _get_default_async_httpx_client,
     _get_default_httpx_client,
+    _validate_compression_destination,
 )
 from langchain_anthropic._compat import (
     _convert_from_v1_to_anthropic,
@@ -1442,6 +1443,17 @@ class ChatAnthropic(BaseChatModel):
     variable.
     """
 
+    request_compression: Literal["gzip"] | None = None
+    """Compress serialized Messages JSON with gzip, without a size threshold.
+
+    !!! warning "Experimental"
+
+        Request compression is experimental and its configuration may change.
+
+    Supported for the direct HTTPS Anthropic API. Defaults to disabled. This changes
+    upload bytes only; model token usage and response streaming are unchanged.
+    """
+
     default_headers: Mapping[str, str] | None = None
     """Headers to pass to the Anthropic clients, will be used for every API call."""
 
@@ -1730,6 +1742,14 @@ class ChatAnthropic(BaseChatModel):
             )
         return values
 
+    @model_validator(mode="after")
+    def _validate_request_compression(self) -> Self:
+        if self.request_compression is not None:
+            _validate_compression_destination(
+                self.anthropic_api_url or "https://api.anthropic.com"
+            )
+        return self
+
     def _resolve_model_profile(self) -> ModelProfile | None:
         profile = _get_default_model_profile(self.model) or None
         if profile is not None and self.betas and "context-1m-2025-08-07" in self.betas:
@@ -1760,7 +1780,10 @@ class ChatAnthropic(BaseChatModel):
     @cached_property
     def _client(self) -> anthropic.Client:
         client_params = self._client_params
-        http_client_params = {"base_url": client_params["base_url"]}
+        http_client_params = {
+            "base_url": client_params["base_url"],
+            "request_compression": self.request_compression,
+        }
         if "timeout" in client_params:
             http_client_params["timeout"] = client_params["timeout"]
         if self.anthropic_proxy:
@@ -1775,7 +1798,10 @@ class ChatAnthropic(BaseChatModel):
     @cached_property
     def _async_client(self) -> anthropic.AsyncClient:
         client_params = self._client_params
-        http_client_params = {"base_url": client_params["base_url"]}
+        http_client_params = {
+            "base_url": client_params["base_url"],
+            "request_compression": self.request_compression,
+        }
         if "timeout" in client_params:
             http_client_params["timeout"] = client_params["timeout"]
         if self.anthropic_proxy:
