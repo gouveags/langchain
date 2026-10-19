@@ -446,11 +446,7 @@ class RunnableConfigurableFields(DynamicRunnable[Input, Output]):
         }
 
         if configurable:
-            init_params = {
-                k: v
-                for k, v in self.default.__dict__.items()
-                if k in type(self.default).model_fields
-            }
+            init_params = self.default._get_configurable_init_params()  # noqa: SLF001
             return (
                 self.default.__class__(**{**init_params, **configurable}),
                 config,

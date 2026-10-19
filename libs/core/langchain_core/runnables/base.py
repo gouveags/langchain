@@ -2856,6 +2856,18 @@ class RunnableSerializable(Serializable, Runnable[Input, Output]):
             dumped["name"] = self.get_name()
         return dumped
 
+    def _get_configurable_init_params(self) -> dict[str, Any]:
+        """Return constructor inputs for configurable-field reconstruction.
+
+        Subclasses can omit generated runtime state. Explicit configurable overrides
+        are applied after these inputs are returned.
+        """
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if key in type(self).model_fields
+        }
+
     def configurable_fields(
         self, **kwargs: AnyConfigurableField
     ) -> RunnableSerializable[Input, Output]:

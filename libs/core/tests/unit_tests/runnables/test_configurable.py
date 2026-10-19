@@ -271,3 +271,53 @@ def test_config_passthrough_nested() -> None:
         configurable_runnable.with_config(
             configurable={"my_other_property": "c", "which": "other"}
         ).my_other_custom_function()  # type: ignore[attr-defined]
+
+
+class ReconstructionHookRunnable(MyOtherRunnable):
+    generated_state: str = "original"
+
+    @override
+    def _get_configurable_init_params(self) -> dict[str, Any]:
+        return {
+            "my_other_property": self.my_other_property,
+            "generated_state": "rebuilt",
+        }
+
+    @override
+    def invoke(
+        self, input: str, config: RunnableConfig | None = None, **kwargs: Any
+    ) -> str:
+        return input + self.my_other_property + self.generated_state
+
+
+def test_configurable_reconstruction_uses_constructor_input_hook() -> None:
+    original = ReconstructionHookRunnable(my_other_property="a")
+    configurable = original.configurable_fields(
+        my_other_property=ConfigurableField(id="property")
+    )
+    assert (
+        configurable.invoke("input:", {"configurable": {"property": "b"}})
+        == "input:brebuilt"
+    )
+    assert original.invoke("input:") == "input:aoriginal"
+
+
+def test_explicit_configurable_override_wins_over_hook_input() -> None:
+    original = ReconstructionHookRunnable(my_other_property="a")
+    configurable = original.configurable_fields(
+        generated_state=ConfigurableField(id="state")
+    )
+    assert (
+        configurable.invoke("input:", {"configurable": {"state": "caller"}})
+        == "input:acaller"
+    )
+    assert original.generated_state == "original"
+
+
+def test_default_configurable_init_params_preserve_model_fields_only() -> None:
+    runnable = MyRunnable(my_property="a")
+    runnable.__dict__["cached_state"] = "internal cache"
+    assert runnable._get_configurable_init_params() == {
+        "name": None,
+        "my_property": "a",
+    }
