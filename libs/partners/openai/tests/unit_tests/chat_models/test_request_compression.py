@@ -1112,3 +1112,64 @@ async def test_resource_override_supports_chat_completions_structured_parse(
     assert (
         json.loads(wire_requests[0].content)["response_format"]["type"] == "json_schema"
     )
+
+
+@pytest.mark.parametrize("compression", [None, "zstd"])
+@pytest.mark.parametrize("entry", ["model_validate", "holder", "type_adapter"])
+async def test_generated_proxy_model_revalidation_preserves_client_identity(
+    wire_requests: list[Any], compression: str | None, entry: str
+) -> None:
+    original = make_model(
+        request_compression=compression, openai_proxy="http://proxy.example:8080"
+    )
+    original_root = original.root_client
+    original_async_root = original.root_async_client
+    original_http = original.http_client
+    original_async_http = original.http_async_client
+    assert original_http is not None
+    assert original_async_http is not None
+    try:
+        if entry == "model_validate":
+            validated = ChatOpenAI.model_validate(original)
+        elif entry == "holder":
+            validated = CompressionModelHolder.model_validate({"model": original}).model
+        else:
+            validated = TypeAdapter(ChatOpenAI).validate_python(original)
+        assert validated is original
+        assert validated.root_client is original_root
+        assert validated.root_async_client is original_async_root
+        assert validated.http_client is original_http
+        assert validated.http_async_client is original_async_http
+        assert validated.invoke("hello").text == "hello"
+        assert_wire(wire_requests[0], compression)
+    finally:
+        assert original_http is not None
+        assert original_async_http is not None
+        original_http.close()
+        await original_async_http.aclose()
+
+
+@pytest.mark.parametrize("compression", [None, "zstd"])
+@pytest.mark.parametrize("field", ["http_client", "http_async_client"])
+async def test_proxy_model_revalidation_rejects_replaced_transports(
+    wire_requests: list[Any], compression: str | None, field: str
+) -> None:
+    original = make_model(
+        request_compression=compression, openai_proxy="http://proxy.example:8080"
+    )
+    original_http = original.http_client
+    original_async_http = original.http_async_client
+    assert original_http is not None
+    assert original_async_http is not None
+    replacement = object()
+    setattr(original, field, replacement)
+    try:
+        with pytest.raises(ValueError, match=r"client|proxy"):
+            ChatOpenAI.model_validate(original)
+        assert getattr(original, field) is replacement
+        assert wire_requests == []
+    finally:
+        assert original_http is not None
+        assert original_async_http is not None
+        original_http.close()
+        await original_async_http.aclose()

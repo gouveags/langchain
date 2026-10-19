@@ -1526,7 +1526,11 @@ class BaseChatOpenAI(BaseChatModel):
         if self.max_retries is not None:
             client_params["max_retries"] = self.max_retries
 
-        if self.openai_proxy and (self.http_client or self.http_async_client):
+        if self.openai_proxy and any(
+            getattr(self, name)
+            and getattr(self, name) is not self._owned_clients.get(name)
+            for name in ("http_client", "http_async_client")
+        ):
             openai_proxy = self.openai_proxy
             http_client = self.http_client
             http_async_client = self.http_async_client
